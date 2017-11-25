@@ -3590,6 +3590,10 @@ TZ_DB::current_zone() const
         const size_t pos = result.find(tz_dir);
         if (pos != result.npos)
             result.erase(0, sizeof(tz_dir)+pos);
+        // BY SAM
+        string to_replace = "default/";
+        if (result.find(to_replace) != string::npos)
+            result.erase(0, to_replace.length());
         return locate_zone(result);
     }
     {
