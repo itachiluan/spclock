@@ -93,6 +93,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -313,17 +314,26 @@ CONSTCD14 const sys_seconds min_seconds = sys_days(min_year/min_day);
 #endif  // USE_OS_TZDB
 
 #ifndef _WIN32
-#  ifndef __APPLE__
-static const std::string tz_dir = "/usr/share/zoneinfo";
-#  else  // __APPLE__
 
 static
 std::string
 discover_tz_dir()
 {
     struct stat sb;
-    CONSTDATA auto timezone = "/etc/localtime";
     using namespace std;
+#  ifndef __APPLE__
+    CONSTDATA auto tz_dir_default = "/usr/share/zoneinfo";
+    CONSTDATA auto tz_dir_buildroot = "/usr/share/zoneinfo/uclibc";
+
+    // Check special path which is valid for buildroot with uclibc builds
+    if(stat(tz_dir_buildroot, &sb) == 0 && S_ISDIR(sb.st_mode))
+        return tz_dir_buildroot;
+    else if(stat(tz_dir_default, &sb) == 0 && S_ISDIR(sb.st_mode))
+        return tz_dir_default;
+    else
+        throw runtime_error("discover_tz_dir failed to find zoneinfo\n");
+#  else  // __APPLE__
+    CONSTDATA auto timezone = "/etc/localtime";
     if (!(lstat(timezone, &sb) == 0 && S_ISLNK(sb.st_mode) && sb.st_size > 0))
         throw runtime_error("discover_tz_dir failed\n");
     string result;
@@ -335,12 +345,15 @@ discover_tz_dir()
     auto i = result.find("zoneinfo");
     if (i == string::npos)
         throw runtime_error("discover_tz_dir failed to find zoneinfo\n");
-    return result.substr(0, i+8);
+    i = result.find('/', i);
+    if (i == string::npos)
+        throw runtime_error("discover_tz_dir failed to find '/'\n");
+    return result.substr(0, i);
+#  endif  // __APPLE__
 }
 
 static const std::string tz_dir = discover_tz_dir();
 
-#  endif  // __APPLE__
 #endif
 
 // +-------------------+
@@ -356,11 +369,11 @@ struct undocumented {explicit undocumented() = default;};
 static_assert(min_year <= max_year, "Configuration error");
 #endif
 
-static std::unique_ptr<TZ_DB> init_tzdb();
+static std::unique_ptr<tzdb> init_tzdb();
 
 tzdb_list::~tzdb_list()
 {
-    const TZ_DB* ptr = head_;
+    const tzdb* ptr = head_;
     head_ = nullptr;
     while (ptr != nullptr)
     {
@@ -376,7 +389,7 @@ tzdb_list::tzdb_list(tzdb_list&& x) noexcept
 }
 
 void
-tzdb_list::push_front(TZ_DB* tzdb) noexcept
+tzdb_list::push_front(tzdb* tzdb) noexcept
 {
     tzdb->next = head_;
     head_ = tzdb;
@@ -393,7 +406,7 @@ tzdb_list::erase_after(const_iterator p) noexcept
 
 struct tzdb_list::undocumented_helper
 {
-    static void push_front(tzdb_list& db_list, TZ_DB* tzdb) noexcept
+    static void push_front(tzdb_list& db_list, tzdb* tzdb) noexcept
     {
         db_list.push_front(tzdb);
     }
@@ -504,7 +517,7 @@ load_timezone_mappings_from_xml_file(const std::string& input_path)
         throw std::runtime_error(msg);
     };
     // [optional space]a="b"
-    auto read_attribute = [&line_num, &line, &error]
+    auto read_attribute = [&line, &error]
                           (const char* name, std::string& value, std::size_t startPos)
                           ->std::size_t
     {
@@ -915,6 +928,8 @@ detail::operator>>(std::istream& is, MonthDayTime& x)
 {
     using namespace date;
     using namespace std::chrono;
+    assert(((std::ios::failbit | std::ios::badbit) & is.exceptions()) ==
+            (std::ios::failbit | std::ios::badbit));
     x = MonthDayTime{};
     if (!is.eof() && ws(is) && !is.eof() && is.peek() != '#')
     {
@@ -932,11 +947,11 @@ detail::operator>>(std::istream& is, MonthDayTime& x)
             else if (std::isalpha(is.peek()))
             {
                 auto dow = parse_dow(is);
-                char c;
+                char c{};
                 is >> c;
                 if (c == '<' || c == '>')
                 {
-                    char c2;
+                    char c2{};
                     is >> c2;
                     if (c2 != '=')
                         throw std::runtime_error(std::string("bad operator: ") + c + c2);
@@ -1395,7 +1410,7 @@ find_previous_rule(const Rule* r, date::year y)
     if (y == r->starting_year())
     {
         if (r == &rules.front() || r->name() != r[-1].name())
-            return {nullptr, year::min()};
+            std::terminate();  // never called with first rule
         --r;
         if (y == r->starting_year())
             return {r, y};
@@ -1685,17 +1700,32 @@ enum class endian
     big    = __ORDER_BIG_ENDIAN__
 };
 
-template <class T>
 static
 inline
-void
-reverse_bytes(T& t)
+std::uint32_t
+reverse_bytes(std::uint32_t i)
 {
-    unsigned char* bytes = static_cast<unsigned char*>(std::memmove(std::addressof(t),
-                                                                    std::addressof(t),
-                                                                    sizeof(T)));
-    for (unsigned i = 0; i < sizeof(T)/2; ++i)
-        std::swap(bytes[i], bytes[sizeof(T)-1-i]);
+    return
+        (i & 0xff000000u) >> 24 |
+        (i & 0x00ff0000u) >> 8 |
+        (i & 0x0000ff00u) << 8 |
+        (i & 0x000000ffu) << 24;
+}
+
+static
+inline
+std::uint64_t
+reverse_bytes(std::uint64_t i)
+{
+    return
+        (i & 0xff00000000000000ull) >> 56 |
+        (i & 0x00ff000000000000ull) >> 40 |
+        (i & 0x0000ff0000000000ull) >> 24 |
+        (i & 0x000000ff00000000ull) >> 8 |
+        (i & 0x00000000ff000000ull) << 8 |
+        (i & 0x0000000000ff0000ull) << 24 |
+        (i & 0x000000000000ff00ull) << 40 |
+        (i & 0x00000000000000ffull) << 56;
 }
 
 template <class T>
@@ -1706,13 +1736,20 @@ maybe_reverse_bytes(T&, std::false_type)
 {
 }
 
-template <class T>
 static
 inline
 void
-maybe_reverse_bytes(T& t, std::true_type)
+maybe_reverse_bytes(std::int32_t& t, std::true_type)
 {
-    reverse_bytes(t);
+    t = static_cast<std::int32_t>(reverse_bytes(static_cast<std::uint32_t>(t)));
+}
+
+static
+inline
+void
+maybe_reverse_bytes(std::int64_t& t, std::true_type)
+{
+    t = static_cast<std::int64_t>(reverse_bytes(static_cast<std::uint64_t>(t)));
 }
 
 template <class T>
@@ -2570,10 +2607,10 @@ get_version()
 # endif
 
 static
-std::unique_ptr<TZ_DB>
+std::unique_ptr<tzdb>
 init_tzdb()
 {
-    std::unique_ptr<TZ_DB> db(new TZ_DB);
+    std::unique_ptr<tzdb> db(new tzdb);
 
     //Iterate through folders
     std::queue<std::string> subfolders;
@@ -2796,7 +2833,7 @@ remote_version()
     std::string str;
     if (download_to_string("http://www.iana.org/time-zones", str))
     {
-        CONSTDATA char db[] = "/time-zones/repository/releases/tzdata";
+        CONSTDATA char db[] = "/time-zones/releases/tzdata";
         CONSTDATA auto db_size = sizeof(db) - 1;
         auto p = str.find(db, 0, db_size);
         const int ver_str_len = 5;
@@ -3201,7 +3238,7 @@ remote_download(const std::string& version)
     }
 #  endif  // _WIN32
 
-    auto url = "http://www.iana.org/time-zones/repository/releases/tzdata" + version +
+    auto url = "http://www.iana.org/time-zones/releases/tzdata" + version +
                ".tar.gz";
     bool result = download_to_file(url, get_download_gz_file(version),
                                    download_file_options::binary);
@@ -3277,7 +3314,7 @@ get_version(const std::string& path)
 }
 
 static
-std::unique_ptr<TZ_DB>
+std::unique_ptr<tzdb>
 init_tzdb()
 {
     using namespace date;
@@ -3285,7 +3322,7 @@ init_tzdb()
     const std::string path = install + folder_delimiter;
     std::string line;
     bool continue_zone = false;
-    std::unique_ptr<TZ_DB> db(new TZ_DB);
+    std::unique_ptr<tzdb> db(new tzdb);
 
 #if AUTO_DOWNLOAD
     if (!file_exists(install))
@@ -3402,7 +3439,7 @@ init_tzdb()
     return db;
 }
 
-const TZ_DB&
+const tzdb&
 reload_tzdb()
 {
 #if AUTO_DOWNLOAD
@@ -3416,7 +3453,7 @@ reload_tzdb()
 
 #endif  // !USE_OS_TZDB
 
-const TZ_DB&
+const tzdb&
 get_tzdb()
 {
     return get_tzdb_list().front();
@@ -3424,9 +3461,9 @@ get_tzdb()
 
 const time_zone*
 #if HAS_STRING_VIEW
-TZ_DB::locate_zone(std::string_view tz_name) const
+tzdb::locate_zone(std::string_view tz_name) const
 #else
-TZ_DB::locate_zone(const std::string& tz_name) const
+tzdb::locate_zone(const std::string& tz_name) const
 #endif
 {
     auto zi = std::lower_bound(zones.begin(), zones.end(), tz_name,
@@ -3479,7 +3516,7 @@ locate_zone(const std::string& tz_name)
 #if USE_OS_TZDB
 
 std::ostream&
-operator<<(std::ostream& os, const TZ_DB& db)
+operator<<(std::ostream& os, const tzdb& db)
 {
     os << "Version: " << db.version << "\n\n";
     for (const auto& x : db.zones)
@@ -3495,7 +3532,7 @@ operator<<(std::ostream& os, const TZ_DB& db)
 #else  // !USE_OS_TZDB
 
 std::ostream&
-operator<<(std::ostream& os, const TZ_DB& db)
+operator<<(std::ostream& os, const tzdb& db)
 {
     os << "Version: " << db.version << '\n';
     std::string title("--------------------------------------------"
@@ -3576,7 +3613,7 @@ getTimeZoneKeyName()
 }
 
 const time_zone*
-TZ_DB::current_zone() const
+tzdb::current_zone() const
 {
     std::string win_tzid = getTimeZoneKeyName();
     std::string standard_tzid;
@@ -3594,7 +3631,7 @@ TZ_DB::current_zone() const
 #else  // !_WIN32
 
 const time_zone*
-TZ_DB::current_zone() const
+tzdb::current_zone() const
 {
     // On some OS's a file called /etc/localtime may
     // exist and it may be either a real file
@@ -3609,22 +3646,51 @@ TZ_DB::current_zone() const
     // exception will be thrown by local_timezone.
     // The path may also take a relative form:
     // "../usr/share/zoneinfo/America/Los_Angeles".
-    struct stat sb;
-    CONSTDATA auto timezone = "/etc/localtime";
-    if (lstat(timezone, &sb) == 0 && S_ISLNK(sb.st_mode) && sb.st_size > 0)
     {
-        using namespace std;
-        string result;
-        char rp[PATH_MAX];
-        if (realpath(timezone, rp))
-            result = string(rp);
-        else
-            throw system_error(errno, system_category(), "realpath() failed");
+        struct stat sb;
+        CONSTDATA auto timezone = "/etc/localtime";
+        if (lstat(timezone, &sb) == 0 && S_ISLNK(sb.st_mode) && sb.st_size > 0) {
+            using namespace std;
+            string result;
+            char rp[PATH_MAX];
+            if (realpath(timezone, rp))
+                result = string(rp);
+            else
+                throw system_error(errno, system_category(), "realpath() failed");
 
-        const size_t pos = result.find(tz_dir);
-        if (pos != result.npos)
-            result.erase(0, tz_dir.size()+1+pos);
-        return locate_zone(result);
+            const size_t pos = result.find(tz_dir);
+            if (pos != result.npos)
+                result.erase(0, tz_dir.size() + 1 + pos);
+            return locate_zone(result);
+        }
+    }
+    // On embedded systems e.g. buildroot with uclibc the timezone is linked
+    // into /etc/TZ which is a symlink to path like this:
+    // "/usr/share/zoneinfo/uclibc/America/Los_Angeles"
+    // If it does, we try to determine the current
+    // timezone from the remainder of the path by removing the prefix
+    // and hoping the rest resolves to valid timezone.
+    // It may not always work though. If it doesn't then an
+    // exception will be thrown by local_timezone.
+    // The path may also take a relative form:
+    // "../usr/share/zoneinfo/uclibc/America/Los_Angeles".
+    {
+        struct stat sb;
+        CONSTDATA auto timezone = "/etc/TZ";
+        if (lstat(timezone, &sb) == 0 && S_ISLNK(sb.st_mode) && sb.st_size > 0) {
+            using namespace std;
+            string result;
+            char rp[PATH_MAX];
+            if (realpath(timezone, rp))
+                result = string(rp);
+            else
+                throw system_error(errno, system_category(), "realpath() failed");
+
+            const size_t pos = result.find(tz_dir);
+            if (pos != result.npos)
+                result.erase(0, tz_dir.size() + 1 + pos);
+            return locate_zone(result);
+        }
     }
     {
     // On some versions of some linux distro's (e.g. Ubuntu),
