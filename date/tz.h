@@ -128,13 +128,17 @@ static_assert(HAS_REMOTE_API == 0 ? AUTO_DOWNLOAD == 0 : true,
 #ifdef _WIN32
 #  ifdef DATE_BUILD_DLL
 #    define DATE_API __declspec(dllexport)
-#  elif defined(DATE_BUILD_LIB)
-#    define DATE_API
-#  else
+#  elif defined(DATE_USE_DLL)
 #    define DATE_API __declspec(dllimport)
+#  else
+#    define DATE_API
 #  endif
 #else
-#  define DATE_API
+#  ifdef DATE_BUILD_DLL
+#    define DATE_API __attribute__ ((visibility ("default")))
+#  else
+#    define DATE_API
+#  endif
 #endif
 
 namespace date
@@ -408,6 +412,7 @@ public:
 
     zoned_time(TimeZonePtr z, const sys_time<Duration>& st);
 
+#if !defined(_MSC_VER) || (_MSC_VER > 1911)
     template <class T = TimeZonePtr,
               class = typename std::enable_if
               <
@@ -417,8 +422,10 @@ public:
                       sys_time<duration>
                   >::value
               >::type>
+#endif
         zoned_time(TimeZonePtr z, const local_time<Duration>& tp);
 
+#if !defined(_MSC_VER) || (_MSC_VER > 1911)
     template <class T = TimeZonePtr,
               class = typename std::enable_if
               <
@@ -429,6 +436,7 @@ public:
                       sys_time<duration>
                   >::value
               >::type>
+#endif
         zoned_time(TimeZonePtr z, const local_time<Duration>& tp, choose c);
 
     zoned_time(TimeZonePtr z, const zoned_time& zt);
@@ -1404,7 +1412,9 @@ zoned_time<Duration, TimeZonePtr>::zoned_time(TimeZonePtr z, const sys_time<Dura
     {}
 
 template <class Duration, class TimeZonePtr>
+#if !defined(_MSC_VER) || (_MSC_VER > 1911)
 template <class, class>
+#endif
 inline
 zoned_time<Duration, TimeZonePtr>::zoned_time(TimeZonePtr z, const local_time<Duration>& t)
     : zone_(std::move(z))
@@ -1412,7 +1422,9 @@ zoned_time<Duration, TimeZonePtr>::zoned_time(TimeZonePtr z, const local_time<Du
     {}
 
 template <class Duration, class TimeZonePtr>
+#if !defined(_MSC_VER) || (_MSC_VER > 1911)
 template <class, class>
+#endif
 inline
 zoned_time<Duration, TimeZonePtr>::zoned_time(TimeZonePtr z, const local_time<Duration>& t,
                                               choose c)
@@ -1901,7 +1913,7 @@ to_stream(std::basic_ostream<CharT, Traits>& os, const CharT* fmt,
     auto tp = sys_time<CT>{t.time_since_epoch() - ls.second};
     auto const sd = floor<days>(tp);
     year_month_day ymd = sd;
-    auto time = make_time(tp - sd);
+    auto time = make_time(tp - sys_seconds{sd});
     time.seconds() += seconds{ls.first};
     fields<CT> fds{ymd, time};
     return to_stream(os, fmt, fds, &abbrev, &offset);
@@ -1935,7 +1947,7 @@ from_stream(std::basic_istream<CharT, Traits>& is, const CharT* fmt,
         bool is_60_sec = fds.tod.seconds() == seconds{60};
         if (is_60_sec)
             fds.tod.seconds() -= seconds{1};
-        auto tmp = to_utc_time(sys_days(fds.ymd) + (fds.tod.to_duration() - *offptr));
+        auto tmp = to_utc_time(sys_days(fds.ymd) - *offptr + fds.tod.to_duration());
         if (is_60_sec)
             tmp += seconds{1};
         if (is_60_sec != is_leap_second(tmp).first || !fds.tod.in_conventional_range())
@@ -2016,10 +2028,10 @@ to_stream(std::basic_ostream<CharT, Traits>& os, const CharT* fmt,
     const string abbrev("TAI");
     CONSTDATA seconds offset{0};
     auto tp = sys_time<CT>{t.time_since_epoch()} -
-              (sys_days(year{1970}/jan/1) - sys_days(year{1958}/jan/1));
+              seconds(sys_days(year{1970}/jan/1) - sys_days(year{1958}/jan/1));
     auto const sd = floor<days>(tp);
     year_month_day ymd = sd;
-    auto time = make_time(tp - sd);
+    auto time = make_time(tp - sys_seconds{sd});
     fields<CT> fds{ymd, time};
     return to_stream(os, fmt, fds, &abbrev, &offset);
 }
@@ -2050,8 +2062,9 @@ from_stream(std::basic_istream<CharT, Traits>& is, const CharT* fmt,
         is.setstate(ios::failbit);
     if (!is.fail())
         tp = tai_time<Duration>{duration_cast<Duration>(
-                (sys_days(fds.ymd) + fds.tod.to_duration() + (sys_days(year{1970}/jan/1) -
-                sys_days(year{1958}/jan/1)) - *offptr).time_since_epoch())};
+                (sys_days(fds.ymd) +
+                 (sys_days(year{1970}/jan/1) - sys_days(year{1958}/jan/1)) -
+                 *offptr + fds.tod.to_duration()).time_since_epoch())};
     return is;
 }
 
@@ -2123,10 +2136,10 @@ to_stream(std::basic_ostream<CharT, Traits>& os, const CharT* fmt,
     const string abbrev("GPS");
     CONSTDATA seconds offset{0};
     auto tp = sys_time<CT>{t.time_since_epoch()} +
-              (sys_days(year{1980}/jan/sun[1]) - sys_days(year{1970}/jan/1));
+              seconds(sys_days(year{1980}/jan/sun[1]) - sys_days(year{1970}/jan/1));
     auto const sd = floor<days>(tp);
     year_month_day ymd = sd;
-    auto time = make_time(tp - sd);
+    auto time = make_time(tp - sys_seconds{sd});
     fields<CT> fds{ymd, time};
     return to_stream(os, fmt, fds, &abbrev, &offset);
 }
@@ -2157,9 +2170,9 @@ from_stream(std::basic_istream<CharT, Traits>& is, const CharT* fmt,
         is.setstate(ios::failbit);
     if (!is.fail())
         tp = gps_time<Duration>{duration_cast<Duration>(
-                (sys_days(fds.ymd) + fds.tod.to_duration() -
-                (sys_days(year{1980}/jan/sun[1]) -
-                sys_days(year{1970}/jan/1)) - *offptr).time_since_epoch())};
+                (sys_days(fds.ymd) -
+                 (sys_days(year{1980}/jan/sun[1]) - sys_days(year{1970}/jan/1)) -
+                 *offptr + fds.tod.to_duration()).time_since_epoch())};
     return is;
 }
 
